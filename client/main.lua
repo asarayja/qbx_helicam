@@ -1,12 +1,15 @@
 local config = require 'config.client'
-local FOV_MAX = 80.0
-local FOV_MIN = 10.0 -- max zoom level (smaller fov is more zoom)
-local ZOOM_SPEED = 2.0 -- camera zoom speed
-local LR_SPEED = 3.0 -- speed by which the camera pans left-right
-local UD_SPEED = 3.0 -- speed by which the camera pans up-down
-local toggleHeliCam = 51 -- control id of the button by which to toggle the heliCam mode. Default: INPUT_CONTEXT (E)
-local toggleVision = 25 -- control id to toggle vision mode. Default: INPUT_AIM (Right mouse btn)
-local toggleLockOn = 22 -- control id to lock onto a vehicle with the camera. Default is INPUT_SPRINT (spacebar)
+local sharedConfig = require 'config.shared'
+
+-- Camera Configuration from config
+local FOV_MAX = config.camera.fovMax
+local FOV_MIN = config.camera.fovMin
+local ZOOM_SPEED = config.camera.zoomSpeed
+local LR_SPEED = config.camera.leftRightSpeed
+local UD_SPEED = config.camera.upDownSpeed
+local toggleHeliCam = config.controls.toggleCamera
+local toggleVision = config.controls.toggleVision
+local toggleLockOn = config.controls.toggleLockOn
 local heliCam = false
 local fov = (FOV_MAX + FOV_MIN) * 0.5
 
@@ -30,9 +33,10 @@ local VEHICLE_LOCK_STATE = {
 local vehicleLockState = VEHICLE_LOCK_STATE.dormant
 local vehicleDetected = nil
 local lockedOnVehicle = nil
+local lastVehicleData = nil -- Cache for vehicle info to avoid duplicate NUI messages
 
 local function isHeliHighEnough(heli)
-    return GetEntityHeightAboveGround(heli) > 1.5
+    return GetEntityHeightAboveGround(heli) > config.heightRequirement.minimum
 end
 
 local function changeVision()
@@ -54,37 +58,36 @@ local function hideHudThisFrame()
     HideHelpTextThisFrame()
     HideHudAndRadarThisFrame()
 
-    local hudComponents = {1, 2, 3, 4, 13, 11, 12, 15, 18, 19}
-    for _, component in ipairs(hudComponents) do
+    for _, component in ipairs(config.hiddenHudComponents) do
         HideHudComponentThisFrame(component)
     end
 end
 
 local function checkInputRotation(cam, zoomValue)
-    local rightAxisX = GetDisabledControlNormal(0, 220)
-    local rightAxisY = GetDisabledControlNormal(0, 221)
+    local rightAxisX = GetDisabledControlNormal(0, config.controls.rightAxisX)
+    local rightAxisY = GetDisabledControlNormal(0, config.controls.rightAxisY)
     local rotation = GetCamRot(cam, 2)
     if rightAxisX == 0.0 and rightAxisY == 0.0 then return end
 
     local zoomFactor = zoomValue + 0.1
     local newZ = rotation.z - rightAxisX * UD_SPEED * zoomFactor
     local newY = rightAxisY * -1.0 * LR_SPEED * zoomFactor
-    local newX = math.max(math.min(20.0, rotation.x + newY), -89.5)
+    local newX = math.max(math.min(config.camera.rotationLimits.maxX, rotation.x + newY), config.camera.rotationLimits.minX)
     SetCamRot(cam, newX, 0.0, newZ, 2)
 end
 
 local function handleZoom(cam)
-    if IsControlJustPressed(0,241) then -- Scrollup
+    if IsControlJustPressed(0, config.controls.scrollUp) then -- Scrollup
         fov = math.max(fov - ZOOM_SPEED, FOV_MIN)
     end
-    if IsControlJustPressed(0,242) then
+    if IsControlJustPressed(0, config.controls.scrollDown) then
         fov = math.min(fov + ZOOM_SPEED, FOV_MAX) -- ScrollDown
     end
     local currentFov = GetCamFov(cam)
     if math.abs(fov - currentFov) < 0.1 then -- the difference is too small, just set the value directly to avoid unneeded updates to FOV of order 10^-5
         fov = currentFov
     end
-    SetCamFov(cam, currentFov + (fov - currentFov) * 0.05) -- Smoothing of camera zoom
+    SetCamFov(cam, currentFov + (fov - currentFov) * config.camera.smoothingFactor) -- Smoothing of camera zoom
 end
 
 local function rotAnglesToVec(rot) -- input vector3
@@ -98,7 +101,7 @@ local function getVehicleInView(cam)
     local camCoords = GetCamCoord(cam)
     local camRot = GetCamRot(cam, 2)
     local forwardVector = rotAnglesToVec(camRot)
-    local targetCoords = camCoords + (forwardVector * 400.0)
+    local targetCoords = camCoords + (forwardVector * config.camera.raycastDistance)
     local rayHandle = CastRayPointToPoint(camCoords.x, camCoords.y, camCoords.z, targetCoords.x, targetCoords.y, targetCoords.z, 10, cache.vehicle, 0)
     local _, _, _, _, entityHit = GetRaycastResult(rayHandle)
 
@@ -116,41 +119,68 @@ local function renderVehicleInfo(vehicle)
     if street2 ~= 0 then
         streetLabel = streetLabel .. ' | ' .. GetStreetNameFromHashKey(street2)
     end
-    SendNUIMessage({
-        type = 'heliupdateinfo',
+    
+    -- Cache the last sent data to avoid sending duplicate NUI messages
+    local currentData = {
         model = vehName,
         plate = licensePlate,
         speed = speed,
         street = streetLabel,
-    })
+    }
+    
+    -- Only send NUI message if data has changed
+    if not lastVehicleData or 
+       lastVehicleData.model ~= currentData.model or
+       lastVehicleData.plate ~= currentData.plate or
+       math.abs(lastVehicleData.speed - currentData.speed) > config.performance.speedUpdateThreshold or
+       lastVehicleData.street ~= currentData.street then
+        
+        SendNUIMessage({
+            type = 'heliupdateinfo',
+            model = currentData.model,
+            plate = currentData.plate,
+            speed = currentData.speed,
+            street = currentData.street,
+        })
+        
+        lastVehicleData = currentData
+    end
 end
 
 local function heliCamThread()
     CreateThread(function()
         local sleep
+        local lastUpdateTime = GetGameTimer()
         while heliCam do
-            sleep = 0
+            sleep = config.performance.minimumThreadSleep -- Minimum wait time to reduce CPU load
+            local currentTime = GetGameTimer()
+            
             if vehicleLockState == VEHICLE_LOCK_STATE.scanning then
-                if scanValue < 100 then
-                    scanValue += 1
-                    SendNUIMessage({
-                        type = 'heliscan',
-                        scanvalue = scanValue,
-                    })
-                    if scanValue == 100 then
+                if scanValue < 100 and currentTime - lastUpdateTime >= config.performance.scanUpdateDelay then
+                    scanValue += config.performance.scanIncrementStep -- Configurable increment step
+                    if scanValue >= 100 then
+                        scanValue = 100
                         PlaySoundFrontend(-1, 'SELECT', 'HUD_FRONTEND_DEFAULT_SOUNDSET', false)
                         lockedOnVehicle = vehicleDetected
                         vehicleLockState = VEHICLE_LOCK_STATE.locked
                     end
-                    sleep = 10
+                    SendNUIMessage({
+                        type = 'heliscan',
+                        scanvalue = scanValue,
+                    })
+                    lastUpdateTime = currentTime
+                    sleep = config.performance.scanSleepActive
                 end
             elseif vehicleLockState == VEHICLE_LOCK_STATE.locked then
                 scanValue = 100
-                renderVehicleInfo(lockedOnVehicle)
-                sleep = 100
+                if currentTime - lastUpdateTime >= config.performance.vehicleInfoUpdateDelay then
+                    renderVehicleInfo(lockedOnVehicle)
+                    lastUpdateTime = currentTime
+                end
+                sleep = config.performance.scanSleepLocked
             else
                 scanValue = 0
-                sleep = 500
+                sleep = config.performance.scanSleepIdle
             end
             Wait(sleep)
         end
@@ -165,7 +195,7 @@ local function unlockCam(cam)
     local oldCam = cam
     DestroyCam(oldCam, false)
     local newCam = CreateCam('DEFAULT_SCRIPTED_FLY_CAMERA', true)
-    AttachCamToEntity(newCam, cache.vehicle, 0.0,0.0,-1.5, true)
+    AttachCamToEntity(newCam, cache.vehicle, config.camera.attachOffset.x, config.camera.attachOffset.y, config.camera.attachOffset.z, true)
     SetCamRot(newCam, rot.x, rot.y, rot.z, 2)
     SetCamFov(newCam, fov)
     RenderScriptCams(true, false, 0, true, false)
@@ -182,6 +212,7 @@ local function turnOffCam()
     heliCam = false
     vehicleLockState = VEHICLE_LOCK_STATE.dormant
     scanValue = 0
+    lastVehicleData = nil -- Reset cached data
     SendNUIMessage({
         type = 'disablescan',
     })
@@ -194,19 +225,25 @@ local function handleInVehicle()
     if not LocalPlayer.state.isLoggedIn then return end
 
     if heliCam then
-        SetTimecycleModifier('heliGunCam')
-        SetTimecycleModifierStrength(0.3)
-        local scaleform = lib.requestScaleformMovie('HELI_CAM')
+        SetTimecycleModifier(config.vision.nightvisionModifier)
+        SetTimecycleModifierStrength(config.vision.nightvisionStrength)
+        local scaleform = lib.requestScaleformMovie(config.scaleform.movieName)
         local cam = CreateCam('DEFAULT_SCRIPTED_FLY_CAMERA', true)
-        AttachCamToEntity(cam, cache.vehicle, 0.0,0.0,-1.5, true)
+        AttachCamToEntity(cam, cache.vehicle, config.camera.attachOffset.x, config.camera.attachOffset.y, config.camera.attachOffset.z, true)
         SetCamRot(cam, 0.0, 0.0, GetEntityHeading(cache.vehicle), 2)
         SetCamFov(cam, fov)
         RenderScriptCams(true, false, 0, true, false)
         PushScaleformMovieFunction(scaleform, 'SET_CAM_LOGO')
-        PushScaleformMovieFunctionParameterInt(0) -- 0 for nothing, 1 for LSPD logo
+        PushScaleformMovieFunctionParameterInt(config.scaleform.logoType) -- Configurable logo type
         PopScaleformMovieFunctionVoid()
         lockedOnVehicle = nil
+        
+        local lastVehicleCheck = 0
+        local vehicleCheckDelay = config.performance.vehicleCheckDelay -- Configurable delay
+        
         while heliCam and not IsEntityDead(cache.ped) and cache.vehicle and isHeliHighEnough(cache.vehicle) do
+            local currentTime = GetGameTimer()
+            
             if IsControlJustPressed(0, toggleHeliCam) then -- Toggle Helicam
                 turnOffCam()
             end
@@ -216,7 +253,6 @@ local function handleInVehicle()
             local zoomValue = 0
             if lockedOnVehicle then
                 if DoesEntityExist(lockedOnVehicle) then
-
                     PointCamAtEntity(cam, lockedOnVehicle, 0.0, 0.0, 0.0, true)
                     if IsControlJustPressed(0, toggleLockOn) then
                         cam = unlockCam(cam)
@@ -231,8 +267,13 @@ local function handleInVehicle()
             else
                 zoomValue = (1.0 / (FOV_MAX - FOV_MIN)) * (fov - FOV_MIN)
                 checkInputRotation(cam, zoomValue)
-                vehicleDetected = getVehicleInView(cam)
-                vehicleLockState = DoesEntityExist(vehicleDetected) and VEHICLE_LOCK_STATE.scanning or VEHICLE_LOCK_STATE.dormant
+                
+                -- Only check for vehicles periodically instead of every frame
+                if currentTime - lastVehicleCheck >= vehicleCheckDelay then
+                    vehicleDetected = getVehicleInView(cam)
+                    vehicleLockState = DoesEntityExist(vehicleDetected) and VEHICLE_LOCK_STATE.scanning or VEHICLE_LOCK_STATE.dormant
+                    lastVehicleCheck = currentTime
+                end
             end
             handleZoom(cam)
             hideHudThisFrame()
@@ -256,10 +297,10 @@ local function handleInVehicle()
 end
 
 local camera = lib.addKeybind({
-    name = 'camera',
+    name = config.keybinds.camera.name,
     description = locale('camera_keybind'),
-    defaultKey = 'E',
-    disabled = true,
+    defaultKey = config.keybinds.camera.defaultKey,
+    disabled = config.keybinds.camera.disabled,
     onPressed = function()
         if not isHeliHighEnough(cache.vehicle) then return end
 
@@ -269,14 +310,19 @@ local camera = lib.addKeybind({
         SendNUIMessage({
             type = 'heliopen',
         })
+        -- Send config to NUI for throttling
+        SendNUIMessage({
+            type = 'updateconfig',
+            throttle = config.nui.updateThrottle,
+        })
     end
 })
 
 local spotlight = lib.addKeybind({
-    name = 'spotlight',
+    name = config.keybinds.spotlight.name,
     description = locale('spotlight_keybind'),
-    defaultKey = 'H',
-    disabled = true,
+    defaultKey = config.keybinds.spotlight.defaultKey,
+    disabled = config.keybinds.spotlight.disabled,
     onPressed = function()
         PlaySoundFrontend(-1, 'SELECT', 'HUD_FRONTEND_DEFAULT_SOUNDSET', false)
 
@@ -287,10 +333,10 @@ local spotlight = lib.addKeybind({
 })
 
 local rappel = lib.addKeybind({
-    name = 'rappel',
+    name = config.keybinds.rappel.name,
     description = locale('rappel_keybind'),
-    defaultKey = 'X',
-    disabled = true,
+    defaultKey = config.keybinds.rappel.defaultKey,
+    disabled = config.keybinds.rappel.disabled,
     onPressed = function()
         PlaySoundFrontend(-1, 'SELECT', 'HUD_FRONTEND_DEFAULT_SOUNDSET', false)
         TaskRappelFromHeli(cache.ped, 1)
@@ -298,7 +344,7 @@ local rappel = lib.addKeybind({
 })
 
 ---@diagnostic disable-next-line: param-type-mismatch
-AddStateBagChangeHandler('spotlight', nil, function(bagName, _, value)
+AddStateBagChangeHandler(sharedConfig.entityState.spotlightStateName, nil, function(bagName, _, value)
     local entity = GetEntityFromStateBagName(bagName)
 
     SetVehicleSearchlight(entity, value, false)
@@ -333,11 +379,11 @@ lib.onCache('seat', function(seat)
         end
     end
 
+    -- Remove the nested CreateThread and use a simpler approach
     CreateThread(function()
         while cache.vehicle do
             handleInVehicle()
-
-            Wait(0)
+            Wait(config.performance.vehicleThreadSleep) -- Configurable delay to prevent excessive CPU usage
         end
     end)
 end)
